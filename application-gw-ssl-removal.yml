@@ -1,0 +1,218 @@
+name: List & Delete Azure Gateway SSL Certificates
+
+on:
+  schedule:
+    ## Trigger at 20:50 every day from Monday through Friday
+    - cron: "50 16 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Choose operation mode"
+        required: true
+        default: "list"
+        type: choice
+        options:
+          - list
+          - list_and_delete
+      gateway-name:
+        description: "Azure Application Gateway Name"
+        required: true
+        default: "baseline-sbox-appgateway"
+      resource-group:
+        description: "Azure Resource Group"
+        required: true
+        default: "baseline-sbox-uksouth"
+
+env:
+  GITHUB_TOKEN: ${{ secrets.BANKIFIBOT_GHTOKEN }}
+  SLACK_TEMPLATE: "slack/gateway_ssl_certs.yml"
+  SLACK_WEBHOOK_URL_ALERTS: ${{ secrets.SLACK_WEBHOOK_URL_ALERTS }}
+
+jobs:
+  get:
+    name: List (and optionally Delete) Azure Application Gateway SSL Certificates
+    runs-on: ubuntu-latest
+    env:
+      GATEWAY_NAME: ${{ github.event.inputs.gateway-name || 'baseline-sbox-appgateway' }}
+      RESOURCE_GROUP: ${{ github.event.inputs.resource-group || 'baseline-sbox-uksouth' }}
+      MODE: ${{ github.event.inputs.mode || 'list_and_delete' }} # default for cron jobs
+
+    steps:
+      - name: Clone Repository
+        uses: actions/checkout@v2
+
+      - name: Azure Login
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Kube Auth
+        uses: azure/aks-set-context@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: "baseline-sbox-aks-uksouth"
+
+      - name: Get SSL Certificates
+        id: get_certs
+        run: |
+          set -e
+          GATEWAY_NAME="${{ env.GATEWAY_NAME }}"
+          RESOURCE_GROUP="${{ env.RESOURCE_GROUP }}"
+          JSON_FILE="ssl-certs.json"
+          MODE="${{ env.MODE }}"
+
+          echo "🔍 Listing SSL Certificates for Gateway: $GATEWAY_NAME in RG: $RESOURCE_GROUP"
+          az network application-gateway ssl-cert list -g $RESOURCE_GROUP --gateway-name $GATEWAY_NAME > $JSON_FILE
+          cert_count=$(jq length $JSON_FILE)
+          cert_names=$(jq -r '.[].name' $JSON_FILE)
+          echo "Total SSL Certificates: $cert_count"
+
+          echo "🔍 Getting listener certificates in use..."
+          used_cert_ids=$(az network application-gateway http-listener list -g $RESOURCE_GROUP --gateway-name $GATEWAY_NAME --query "[].sslCertificate.id" -o tsv)
+
+          echo "🔍 Getting expiry info from Kubernetes certificates..."
+          expiry_info=$(kubectl get certificate --all-namespaces -ojsonpath="{range .items[*]}cert-{.metadata.namespace}-{.metadata.name} not after: {.status.notAfter}{'\n'}{end}")
+
+          all_list=""
+          delete_list=""
+          today=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          for cert_name in $cert_names; do
+            cert_id=$(jq -r ".[] | select(.name==\"$cert_name\") | .id" $JSON_FILE)
+            expiry_date=$(echo "$expiry_info" | grep -m 1 "$cert_name not after:" | awk '{print $NF}')
+
+            in_use=false
+            if echo "$used_cert_ids" | grep -q "$cert_id"; then
+              in_use=true
+            fi
+
+            if [ -z "$expiry_date" ] || [[ "$expiry_date" < "$today" ]]; then
+              status="EXPIRED"
+            else
+              status="ACTIVE"
+            fi
+
+            usage_status="IN-USE"
+            if [ "$in_use" = false ]; then
+              usage_status="UNUSED"
+            fi
+
+            all_list+="• $cert_name — $status / $usage_status (expires: ${expiry_date:-unknown})\n"
+
+            # Only expired OR unused certs go into delete list
+            if [ "$status" = "EXPIRED" ] || [ "$in_use" = false ]; then
+              delete_list+="• $cert_name — $status / $usage_status\n"
+              if [ "$MODE" = "list_and_delete" ]; then
+                echo "🗑️ Deleting SSL Certificate: $cert_name"
+                az network application-gateway ssl-cert delete -g $RESOURCE_GROUP --gateway-name $GATEWAY_NAME -n $cert_name --yes || true
+              fi
+            fi
+          done
+
+          echo "cert_count=$cert_count" >> $GITHUB_OUTPUT
+          echo "all_list<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$all_list"
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "delete_list<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$delete_list"
+          echo "EOF" >> $GITHUB_OUTPUT
+  
+      # - name: Get SSL Certificates
+      #   id: get_certs
+      #   run: |
+      #     set -e
+      #     GATEWAY_NAME="${{ env.GATEWAY_NAME }}"
+      #     RESOURCE_GROUP="${{ env.RESOURCE_GROUP }}"
+      #     JSON_FILE="ssl-certs.json"
+
+      #     echo "🔍 Listing SSL Certificates for Gateway: $GATEWAY_NAME in RG: $RESOURCE_GROUP"
+      #     az network application-gateway ssl-cert list -g $RESOURCE_GROUP --gateway-name $GATEWAY_NAME > $JSON_FILE
+      #     cert_count=$(jq length $JSON_FILE)
+      #     cert_names=$(jq -r '.[].name' $JSON_FILE)
+      #     echo "Total SSL Certificates: $cert_count"
+
+      #     echo "🔍 Getting listener certificates in use..."
+      #     used_cert_ids=$(az network application-gateway http-listener list -g $RESOURCE_GROUP --gateway-name $GATEWAY_NAME --query "[].sslCertificate.id" -o tsv)
+          
+      #     echo "🔍 Getting expiry info from cluster certificates..."
+      #     expiry_info=$(kubectl get certificate --all-namespaces -ojsonpath="{range .items[*]}cert-{.metadata.namespace}-{.metadata.name} not after: {.status.notAfter}{'\n'}{end}")
+
+      #     active_list=""
+      #     expired_list=""
+      #     unused_list=""
+      #     delete_list=""
+      #     today=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+      #     for cert_name in $cert_names; do
+      #       cert_id=$(jq -r ".[] | select(.name==\"$cert_name\") | .id" $JSON_FILE)
+      #       expiry_date=$(echo "$expiry_info" | grep -m 1 "$cert_name not after:" | awk '{print $NF}')
+
+      #       in_use=false
+      #       if echo "$used_cert_ids" | grep -q "$cert_id"; then
+      #         in_use=true
+      #       fi
+
+      #       if [ -z "$expiry_date" ] || [[ "$expiry_date" < "$today" ]]; then
+      #         status="EXPIRED"
+      #       else
+      #         status="ACTIVE"
+      #       fi
+
+      #       if [ "$status" = "EXPIRED" ]; then
+      #         echo "❌ Expired: $cert_name"
+      #         expired_list+="$cert_name\n"
+      #       elif [ "$in_use" = false ]; then
+      #         echo "💤 Unused: $cert_name"
+      #         unused_list+="$cert_name\n"
+      #       else
+      #         echo "✅ Active and In Use: $cert_name (expires $expiry_date)"
+      #         active_list+="• $cert_name — $expiry_date\n"
+      #       fi
+
+      #       # Deletion condition: expired OR not in use
+      #       if [ "$status" = "EXPIRED" ] || [ "$in_use" = false ]; then
+      #         delete_list+="$cert_name\n"
+      #         if [ "${{ env.MODE }}" = "list_and_delete" ]; then
+      #           echo "🗑️ Deleting SSL Certificate: $cert_name"
+      #           az network application-gateway ssl-cert delete -g $RESOURCE_GROUP --gateway-name $GATEWAY_NAME -n $cert_name --yes || true
+      #         fi
+      #       fi
+      #     done
+
+      #     echo "cert_count=$cert_count" >> $GITHUB_OUTPUT
+      #     echo "active_list<<EOF" >> $GITHUB_OUTPUT
+      #     echo -e "$active_list"
+      #     echo "EOF" >> $GITHUB_OUTPUT
+      #     echo "expired_list<<EOF" >> $GITHUB_OUTPUT
+      #     echo -e "$expired_list"
+      #     echo "EOF" >> $GITHUB_OUTPUT
+      #     echo "unused_list<<EOF" >> $GITHUB_OUTPUT
+      #     echo -e "$unused_list"
+      #     echo "EOF" >> $GITHUB_OUTPUT
+      #     echo "delete_list<<EOF" >> $GITHUB_OUTPUT
+      #     echo -e "$delete_list"
+      #     echo "EOF" >> $GITHUB_OUTPUT
+          
+
+      - name: Summary
+        run: |
+          echo "Total SSL Certs in Gateway: ${{ steps.get_certs.outputs.cert_count }}"
+          echo "Expired or Orphaned SSL Certs: "
+          echo -e "${{ steps.get_certs.outputs.filtered_list }}"
+           
+
+      - name: Slack Notification
+        if: always()
+        run: |
+          sed -i "s|inputs.TOTAL_COUNT|${{ steps.get_certs.outputs.cert_count }}|" $SLACK_TEMPLATE
+          sed -i "s|inputs.TO_DELETE|${{ steps.get_certs.outputs.filtered_list }}|" $SLACK_TEMPLATE
+          cp $SLACK_TEMPLATE slack.yml
+      - uses: act10ns/slack@v1.5.0
+        with: 
+          status: ${{ job.status }}
+          steps: ${{ toJson(steps) }}
+          channel: "alerts"
+          config: slack.yml
+        if: always()
